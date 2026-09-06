@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idxbot"
+version = "0.10.0"
+description = "IDX Signal Bot — Indonesian stock signal system with paper trading (no live trading)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "IDX Signal Bot" }]
+dependencies = [
+    "pydantic>=2.5,<3",
+    "numpy>=1.26,<3",
+    "pandas>=2.0,<3",
+    "scikit-learn>=1.4,<1.6",
+    "scipy>=1.11,<2",
+    "pyarrow>=14,<19",
+    "joblib>=1.3,<2",
+    "requests>=2.28,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-cov>=4.1,<6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["idxbot"]
+branch = true

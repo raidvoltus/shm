@@ -1,0 +1,9 @@
+[
+  {
+    "trade_id": "RESET_BOUNDARY",
+    "side": "RESET",
+    "timestamp": "2026-09-06T17:21:14.966370+00:00",
+    "note": "Paper account reset; prior trades cleared for new session",
+    "previous_n_trades": 1
+  }
+]
