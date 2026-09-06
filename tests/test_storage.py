@@ -1,12 +1,19 @@
-"""Storage backend and state serialization tests."""
+"""Storage backend and state serialization tests (local atomic, no S3)."""
+
+from __future__ import annotations
 
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from idxbot.storage import LocalStorageBackend, AccountState, PortfolioState
-from idxbot.storage.backend import ObjectStorageBackend
+from idxbot.storage import (
+    AccountState,
+    LocalStorageBackend,
+    PortfolioState,
+    StateCorruptionError,
+    VersionConflictError,
+)
 
 
 def test_local_storage_save_load_delete():
@@ -60,6 +67,19 @@ def test_portfolio_state_roundtrip():
         assert restored.signal_history == []
 
 
-def test_object_storage_not_implemented():
-    with pytest.raises(NotImplementedError):
-        ObjectStorageBackend(bucket="test-bucket")
+def test_atomic_write_no_tmp_left():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = LocalStorageBackend(root=tmp)
+        backend.save_state("atomic", {"v": 1})
+        files = list(Path(tmp).glob("*"))
+        assert any(f.name.endswith("atomic.json") for f in files)
+        assert not any(f.name.endswith(".tmp") for f in files)
+
+
+def test_corrupt_state_fail_closed():
+    with tempfile.TemporaryDirectory() as tmp:
+        backend = LocalStorageBackend(root=tmp)
+        path = Path(tmp) / "corrupt.json"
+        path.write_text("{not-json", encoding="utf-8")
+        with pytest.raises(StateCorruptionError):
+            backend.load_state("corrupt")
