@@ -1,28 +1,31 @@
-name: IDX Learning Mode (Weekend)
+name: IDX Signal Mode (Weekday)
 
 on:
   schedule:
-    # 03:00 UTC Saturday ≈ 10:00 Asia/Jakarta
-    - cron: "0 3 * * 6"
+    # 02:00 UTC ≈ 09:00 Asia/Jakarta (WIB = UTC+7)
+    - cron: "0 2 * * 1-5"
   workflow_dispatch:
 
 concurrency:
-  group: idx-learning
+  group: idx-signal
   cancel-in-progress: false
 
 jobs:
-  learning:
+  signal:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
       LIVE_TRADING: "false"
       PAPER_TRADING: "true"
       PAPER_TRADING_ONLY: "true"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_ENABLED: "true"
       ENABLE_COLAB: "false"
-      ENABLE_LOCAL_TRAINING: "true"
-      MAX_TRAINING_MINUTES: "19"
+      ENABLE_LOCAL_TRAINING: "false"
       IDXBOT_USE_FIXTURE: "true"
       PYTHONPATH: src
+      MAX_TRAINING_MINUTES: "19"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
@@ -44,27 +47,25 @@ jobs:
           s = get_settings()
           s.assert_safe()
           assert s.live_trading is False
-          print('Learning safety OK, budget=', s.max_training_minutes)
+          assert s.paper_trading is True
+          print('PAPER_TRADING_ONLY / LIVE_TRADING guard OK')
           "
 
-      - name: Restore ML artifacts
+      - name: Restore state
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: idxbot-ml
-          path: .
+          name: idxbot-state
+          path: .state
         continue-on-error: true
 
-      - name: Learning pipeline
+      - name: Signal pipeline
         run: |
-          python -m idxbot --mode LEARNING --json
+          python -m idxbot --mode SIGNAL --json
 
-      - name: Persist ML / experience
+      - name: Persist state
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: idxbot-ml
-          path: |
-            .models
-            .experience
-            ml
+          name: idxbot-state
+          path: .state
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 14
