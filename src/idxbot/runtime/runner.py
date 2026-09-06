@@ -20,7 +20,7 @@ from idxbot.logging import get_logger
 from idxbot.runtime.clock import MarketClock, ExecutionContext, LatencyDecision
 from idxbot.runtime.idempotency import ExecutionIdentity, IdempotencyStore
 from idxbot.runtime.retry import RetryPolicy, FatalError, StateCorruption, ConfigurationError
-from idxbot.storage.s3_backend import build_storage_backend
+from idxbot.storage import build_storage_backend
 from idxbot.storage.backend import (
     LocalStorageBackend,
     StorageBackend,
