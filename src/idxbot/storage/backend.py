@@ -41,7 +41,9 @@ class StorageBackend(ABC):
         ...
 
     @abstractmethod
-    def save_state(self, key: str, data: dict[str, Any]) -> None:
+    def save_state(
+        self, key: str, data: dict[str, Any], *, expected_version: Optional[int] = None
+    ) -> None:
         """Persist state under key (atomic where possible)."""
         ...
 
@@ -93,6 +95,16 @@ class LocalStorageBackend(StorageBackend):
             raise StateCorruptionError(
                 f"State for key={key!r} is not a dict. FAIL CLOSED."
             )
+        stored_checksum = data.get("_checksum")
+        if stored_checksum:
+            unsigned = {k: v for k, v in data.items() if k != "_checksum"}
+            canonical = json.dumps(
+                unsigned, indent=2, default=str, sort_keys=True
+            ).encode("utf-8")
+            if stored_checksum != _checksum(canonical):
+                raise StateCorruptionError(
+                    f"Checksum mismatch for key={key!r}. FAIL CLOSED."
+                )
         return data
 
     def save_state(
@@ -116,14 +128,21 @@ class LocalStorageBackend(StorageBackend):
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # Optimistic concurrency
-        if expected_version is not None and path.exists():
-            current = self.load_state(key)
-            current_ver = (current or {}).get("state_version")
-            if current_ver is not None and current_ver != expected_version:
-                raise VersionConflictError(
-                    f"Version conflict for {key!r}: expected {expected_version}, "
-                    f"found {current_ver}. DO NOT OVERWRITE."
-                )
+        if expected_version is not None:
+            current = self.load_state(key) if path.exists() else None
+            if current is None:
+                if expected_version != 0:
+                    raise VersionConflictError(
+                        f"Version conflict for {key!r}: expected {expected_version}, "
+                        "but state is missing. DO NOT OVERWRITE."
+                    )
+            else:
+                current_ver = int(current.get("state_version", 0))
+                if current_ver != expected_version:
+                    raise VersionConflictError(
+                        f"Version conflict for {key!r}: expected {expected_version}, "
+                        f"found {current_ver}. DO NOT OVERWRITE."
+                    )
 
         # Ensure version field present
         if "state_version" not in data:
@@ -190,7 +209,9 @@ class ObjectStorageBackend(StorageBackend):
     def load_state(self, key: str) -> Optional[dict[str, Any]]:
         raise NotImplementedError
 
-    def save_state(self, key: str, data: dict[str, Any]) -> None:
+    def save_state(
+        self, key: str, data: dict[str, Any], *, expected_version: Optional[int] = None
+    ) -> None:
         raise NotImplementedError
 
     def delete_state(self, key: str) -> None:

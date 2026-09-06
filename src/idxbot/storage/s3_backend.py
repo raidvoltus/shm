@@ -155,6 +155,12 @@ class S3CompatibleStorageBackend(StorageBackend):
             raise StateCorruptionError(f"S3 corrupt JSON for {key}") from e
         if not isinstance(data, dict):
             raise StateCorruptionError(f"S3 state not dict for {key}")
+        stored_checksum = data.get("checksum")
+        if stored_checksum:
+            unsigned = {k: v for k, v in data.items() if k != "checksum"}
+            canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if stored_checksum != _sha256(canonical):
+                raise StateCorruptionError(f"S3 checksum mismatch for {key}")
         return data
 
     def save_state(
@@ -166,7 +172,12 @@ class S3CompatibleStorageBackend(StorageBackend):
         # optimistic concurrency on state_version field
         if expected_version is not None:
             current = self.load_state(key)
-            if current is not None:
+            if current is None:
+                if expected_version != 0:
+                    raise VersionConflictError(
+                        f"version conflict key={key}: expected={expected_version} current=missing"
+                    )
+            else:
                 cur_v = int(current.get("state_version", 0))
                 if cur_v != expected_version:
                     raise VersionConflictError(
@@ -212,9 +223,11 @@ class S3CompatibleStorageBackend(StorageBackend):
             host=self._host(),
         )
         try:
-            requests.delete(self._url(object_key), headers=headers, timeout=self.timeout)
-        except requests.RequestException:
-            pass
+            resp = requests.delete(self._url(object_key), headers=headers, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise StorageError(f"S3 delete network error: {type(e).__name__}") from e
+        if resp.status_code not in (200, 204, 404):
+            raise StorageError(f"S3 delete HTTP {resp.status_code}")
 
     def exists(self, key: str) -> bool:
         try:

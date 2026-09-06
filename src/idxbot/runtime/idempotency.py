@@ -40,18 +40,18 @@ class IdempotencyStore:
     def __init__(self, backend: StorageBackend) -> None:
         self.backend = backend
 
-    def _load(self) -> dict[str, Any]:
+    def _load(self) -> tuple[dict[str, Any], int]:
         data = self.backend.load_state(self.KEY)
         if data is None:
-            return {"completed": {}}
-        return data
+            return {"completed": {}, "state_version": 0}, 0
+        return data, int(data.get("state_version", 0))
 
     def already_executed(self, identity: ExecutionIdentity) -> bool:
-        store = self._load()
+        store, _ = self._load()
         return identity.key() in store.get("completed", {})
 
     def mark_completed(self, identity: ExecutionIdentity) -> None:
-        store = self._load()
+        store, version = self._load()
         completed = store.setdefault("completed", {})
         completed[identity.key()] = {
             **identity.to_dict(),
@@ -62,4 +62,5 @@ class IdempotencyStore:
             keys = sorted(completed.keys())
             for k in keys[: len(completed) - 200]:
                 del completed[k]
-        self.backend.save_state(self.KEY, store)
+        store["state_version"] = version + 1
+        self.backend.save_state(self.KEY, store, expected_version=version)

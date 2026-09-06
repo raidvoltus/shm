@@ -143,7 +143,7 @@ class MarketRuntime:
         data = ps.to_dict()
         data["state_version"] = expected_version + 1
         self.storage.save_state(
-            PORTFOLIO_KEY, data, expected_version=expected_version if expected_version > 0 else None
+            PORTFOLIO_KEY, data, expected_version=expected_version
         )
         return expected_version + 1
 

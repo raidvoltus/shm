@@ -21,7 +21,15 @@ jobs:
       ENABLE_COLAB: "false"
       ENABLE_LOCAL_TRAINING: "true"
       MAX_TRAINING_MINUTES: "19"
-      IDXBOT_USE_FIXTURE: "true"
+      IDXBOT_USE_FIXTURE: "false"
+      IDXBOT_DATA_PROVIDER_PRIORITY: "yahoo_chart"
+      IDXBOT_STATE_BACKEND: "s3"
+      IDXBOT_S3_ENDPOINT: ${{ secrets.IDXBOT_S3_ENDPOINT }}
+      IDXBOT_S3_BUCKET: ${{ secrets.IDXBOT_S3_BUCKET }}
+      IDXBOT_S3_ACCESS_KEY: ${{ secrets.IDXBOT_S3_ACCESS_KEY }}
+      IDXBOT_S3_SECRET_KEY: ${{ secrets.IDXBOT_S3_SECRET_KEY }}
+      IDXBOT_S3_REGION: ${{ secrets.IDXBOT_S3_REGION }}
+      IDXBOT_S3_PREFIX: idxbot/state/
       PYTHONPATH: src
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -37,6 +45,12 @@ jobs:
           pip install -r requirements.txt
           pip install -e .
 
+      - name: Production preflight
+        run: python scripts/production_preflight.py
+
+      - name: Restore durable ML artifacts
+        run: python scripts/s3_artifacts.py pull
+
       - name: Safety guard
         run: |
           python -c "
@@ -47,24 +61,12 @@ jobs:
           print('Learning safety OK, budget=', s.max_training_minutes)
           "
 
-      - name: Restore ML artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-        with:
-          name: idxbot-ml
-          path: .
-        continue-on-error: true
 
       - name: Learning pipeline
         run: |
           python -m idxbot --mode LEARNING --json
 
-      - name: Persist ML / experience
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          name: idxbot-ml
-          path: |
-            .models
-            .experience
-            ml
-          if-no-files-found: ignore
-          retention-days: 30
+      - name: Persist durable ML artifacts
+        if: success()
+        run: python scripts/s3_artifacts.py push
+

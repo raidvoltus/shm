@@ -38,6 +38,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    env:
+      LIVE_TRADING: "false"
+      PAPER_TRADING: "true"
+      PAPER_TRADING_ONLY: "true"
+      IDXBOT_USE_FIXTURE: "false"
+      IDXBOT_DATA_PROVIDER_PRIORITY: "yahoo_chart"
+      IDXBOT_STATE_BACKEND: "s3"
+      IDXBOT_S3_ENDPOINT: ${{ secrets.IDXBOT_S3_ENDPOINT }}
+      IDXBOT_S3_BUCKET: ${{ secrets.IDXBOT_S3_BUCKET }}
+      IDXBOT_S3_ACCESS_KEY: ${{ secrets.IDXBOT_S3_ACCESS_KEY }}
+      IDXBOT_S3_SECRET_KEY: ${{ secrets.IDXBOT_S3_SECRET_KEY }}
+      IDXBOT_S3_REGION: ${{ secrets.IDXBOT_S3_REGION }}
+      IDXBOT_S3_PREFIX: idxbot/state/
+      TELEGRAM_ENABLED: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -53,6 +69,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
+
+      - name: Production preflight
+        run: python scripts/production_preflight.py
+
+      - name: Restore durable ML artifacts
+        run: python scripts/s3_artifacts.py pull
 
       - name: Safety assert
         run: |
@@ -85,7 +107,3 @@ jobs:
             ARGS="$ARGS --scheduled-at ${{ github.event.inputs.scheduled_at }}"
           fi
           python -m idxbot $ARGS
-        env:
-          # No secrets required for paper-only batch
-          PAPER_TRADING: "true"
-          LIVE_TRADING: "false"

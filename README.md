@@ -307,3 +307,13 @@ PYTHONPATH=src python -m pytest tests/ -q
 7. Colab failure → local fallback; never blocks SIGNAL mode.
 
 **THIS SYSTEM IS PAPER TRADING ONLY. NO REAL BROKER EXECUTION.**
+### Push without configuring a remote
+
+The repository can be pushed directly to a Git URL without adding or storing a `remote` entry:
+
+```bash
+./scripts/push_without_remote.sh https://github.com/OWNER/REPO.git main
+```
+
+Authentication is still required by the Git provider (for example, an already-authenticated Git Credential Manager, SSH agent, or credential helper). The script does not store credentials and does not modify `.git/config`.
+

@@ -37,7 +37,7 @@ jobs:
 
       - name: Unit + adversarial leakage tests
         run: |
-          python -m pytest tests/unit tests/adversarial -v --tb=short
+          python -m pytest tests/ -v --tb=short
 
       - name: Safety invariants
         run: |
