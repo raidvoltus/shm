@@ -1,8 +1,9 @@
 """
 Storage abstraction for IDX Signal Bot.
 
-GitHub Actions runners are ephemeral. Production persistence must use
-object storage (S3-compatible). LocalStorageBackend is for local tests only.
+Local atomic filesystem storage only. S3/object storage is not used.
+
+Atomic write pattern is mandatory. Integrity/version failures fail-closed.
 
 Atomic write pattern:
   state.json → state.tmp → write → flush → fsync → validate → os.replace → state.json
@@ -66,7 +67,7 @@ class LocalStorageBackend(StorageBackend):
     """
     Filesystem backend with atomic replace and optional version checks.
 
-    Not suitable for production GitHub Actions runners (ephemeral disk).
+    Ephemeral on GitHub Actions runners — treat as job-local state only, not durable production DB.
     """
 
     def __init__(self, root: str | Path = ".state") -> None:
@@ -127,7 +128,6 @@ class LocalStorageBackend(StorageBackend):
         tmp = self._tmp_path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Optimistic concurrency
         if expected_version is not None:
             current = self.load_state(key) if path.exists() else None
             if current is None:
@@ -144,7 +144,6 @@ class LocalStorageBackend(StorageBackend):
                         f"found {current_ver}. DO NOT OVERWRITE."
                     )
 
-        # Ensure version field present
         if "state_version" not in data:
             data = {**data, "state_version": (expected_version or 0) + 1}
 
@@ -163,14 +162,12 @@ class LocalStorageBackend(StorageBackend):
                 f.flush()
                 os.fsync(f.fileno())
 
-            # Validate temp is readable JSON
             check = json.loads(tmp.read_bytes().decode("utf-8"))
             if not isinstance(check, dict):
                 raise StorageError("Temp validation failed: not a dict")
 
-            os.replace(tmp, path)  # atomic on POSIX
+            os.replace(tmp, path)
         except Exception:
-            # Leave previous state.json intact
             if tmp.exists():
                 try:
                     tmp.unlink()
@@ -188,34 +185,3 @@ class LocalStorageBackend(StorageBackend):
 
     def exists(self, key: str) -> bool:
         return self._path(key).exists()
-
-
-class ObjectStorageBackend(StorageBackend):
-    """
-    Contract for S3-compatible object storage.
-
-    Implementation is deferred. Credentials via env / IAM — never hardcoded.
-    """
-
-    def __init__(self, bucket: str, prefix: str = "idxbot/") -> None:
-        self.bucket = bucket
-        self.prefix = prefix
-        raise NotImplementedError(
-            "ObjectStorageBackend is a contract only. "
-            "Concrete S3-compatible implementation will be added later. "
-            "Do not hardcode credentials."
-        )
-
-    def load_state(self, key: str) -> Optional[dict[str, Any]]:
-        raise NotImplementedError
-
-    def save_state(
-        self, key: str, data: dict[str, Any], *, expected_version: Optional[int] = None
-    ) -> None:
-        raise NotImplementedError
-
-    def delete_state(self, key: str) -> None:
-        raise NotImplementedError
-
-    def exists(self, key: str) -> bool:
-        raise NotImplementedError
