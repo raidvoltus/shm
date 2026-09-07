@@ -7,6 +7,7 @@ from idxbot.idempotency.ledger import (
     LedgerEntry,
     LedgerUnavailable,
     MemoryLedgerStore,
+    validate_ledger_payload,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "LedgerEntry",
     "LedgerUnavailable",
     "MemoryLedgerStore",
+    "validate_ledger_payload",
 ]

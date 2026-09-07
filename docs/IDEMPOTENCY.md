@@ -2,49 +2,48 @@
 
 ## Guarantee
 
-**AT-MOST-ONCE** notification for BUY/SELL when the ledger is required.
+**AT-MOST-ONCE** (conditional / best-effort), **not** exactly-once.
 
 Prefer a missed Telegram message over a duplicate BUY/SELL.
 
-Not exactly-once: a crash between Telegram HTTP success and ledger finalize can still allow a later retry after PENDING lease expiry.
+Crash window remains between Telegram HTTP completion and ledger finalize.
 
 ## SignalID
 
 `SHA256(symbol | timestamp_bucket | feature_version | model_version | intent)`
 
-Deterministic identity; ledger provides persistent idempotency.
-
 ## Backend
 
-- Branch: `idxbot-state`
-- Path: `idempotency/ledger.json`
-- API: GitHub Contents API + `GITHUB_TOKEN` (`permissions.contents: write`)
-- Alternatives: `IDXBOT_LEDGER_BACKEND=file|memory` for tests/local
+- Branch: `idxbot-state` / `idempotency/ledger.json`
+- GitHub Contents API + `GITHUB_TOKEN` (`permissions.contents: write`)
+- Not used: GitHub Actions artifacts
 
-**Not used:** GitHub Actions artifacts (not a database; cannot restore across runs reliably).
+## State machine
 
-## TTL / bounds
+| From | To | Trigger |
+|------|-----|---------|
+| ABSENT | PENDING | reserve() before send |
+| PENDING | SUCCESS | Telegram 2xx |
+| PENDING | UNKNOWN_DELIVERY_STATE | Timeout / ambiguous response |
+| PENDING | PERMANENT_FAILURE | HTTP 4xx (not 429) |
+| PENDING | TRANSIENT_FAILURE | Exhausted in-process retries |
+| PENDING (lease expired) | UNKNOWN_DELIVERY_STATE | Safety: may have delivered |
+| SUCCESS / UNKNOWN / PERMANENT | terminal (TTL block) | — |
 
-- TTL: 24 hours
-- MAX_ENTRIES: 500
-- PENDING lease: 30 minutes
+## PENDING expiry
 
-## Delivery states
+**Policy:** promote to `UNKNOWN_DELIVERY_STATE`, remain blocking for TTL (24h).
 
-| Status | Effect |
-|--------|--------|
-| PENDING | Reservation; blocks duplicate while lease valid |
-| SUCCESS | Blocks re-send for TTL |
-| UNKNOWN_DELIVERY_STATE | Blocks re-send (timeout may have delivered) |
-| PERMANENT_FAILURE | No auto cross-run retry |
-| TRANSIENT_FAILURE | In-process retry only; may finalize after exhausted |
+Do **not** allow automatic resend after 30m lease — Telegram may already have accepted.
 
 ## Failure policy
 
-`IDXBOT_LEDGER_REQUIRED=true` (default on GitHub Actions):
+`IDXBOT_LEDGER_REQUIRED=true` (default on GHA):
 
-Ledger unavailable → **do not send** BUY/SELL (fail-closed).
+- Ledger unavailable / SHA conflict / corrupt → **do not send** BUY/SELL.
+
+Corrupt ledger is **never** silently reinitialized.
 
 ## Concurrency
 
-`signal.yml` concurrency group `idx-signal` with `cancel-in-progress: false` serializes writers.
+`signal.yml`: `concurrency.group: idx-signal`, `cancel-in-progress: false`.
