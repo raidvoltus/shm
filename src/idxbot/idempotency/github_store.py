@@ -20,6 +20,7 @@ from idxbot.idempotency.ledger import (
     FileLedgerStore,
     LedgerUnavailable,
     MemoryLedgerStore,
+    validate_ledger_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,11 +101,14 @@ class GitHubLedgerStore:
             raise LedgerUnavailable(f"github ledger decode failed: {type(e).__name__}") from e
         if not isinstance(data, dict):
             raise LedgerUnavailable("github ledger corrupt")
-        data.setdefault("schema_version", SCHEMA_VERSION)
-        data.setdefault("entries", [])
-        return data
+        if not data:
+            return {"schema_version": SCHEMA_VERSION, "entries": []}
+        if "schema_version" not in data and "entries" not in data:
+            return {"schema_version": SCHEMA_VERSION, "entries": []}
+        return validate_ledger_payload(data)
 
     def save(self, payload: dict[str, Any]) -> None:
+        validate_ledger_payload(payload)
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         content_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
         body: dict[str, Any] = {
@@ -135,12 +139,6 @@ class GitHubLedgerStore:
 
 
 def build_ledger_store():
-    """
-    Select store from environment.
-
-    IDXBOT_LEDGER_BACKEND=github|file|memory
-    Default: github if GITHUB_TOKEN+GITHUB_REPOSITORY set, else memory.
-    """
     backend = os.environ.get("IDXBOT_LEDGER_BACKEND", "").strip().lower()
     if not backend:
         if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPOSITORY"):
