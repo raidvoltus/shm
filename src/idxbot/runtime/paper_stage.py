@@ -11,6 +11,7 @@ from idxbot.portfolio.store import (
     format_portfolio_telegram,
 )
 from idxbot.signals.order_intent import OrderIntent
+from idxbot.narrator.gemini import narrate_signal
 
 
 def run_paper_stage(
@@ -22,7 +23,7 @@ def run_paper_stage(
     run_id: str,
     decision_by_sid: dict,
 ) -> str | None:
-    """TOP-1 BUY → persist → return portfolio telegram block."""
+    """TOP-1 BUY → persist → Gemini narrator → portfolio telegram block."""
     store = LocalPortfolioStore(os.environ.get("IDXBOT_PORTFOLIO_DIR", ".state"))
     engine = PaperPortfolioEngine(store)
     try:
@@ -75,18 +76,39 @@ def run_paper_stage(
                 {"transaction_id": tx["transaction_id"]},
             )
         )
-        return format_portfolio_telegram(
-            bundle,
-            top={
+        top_payload = {
+            "action": "BUY",
+            "symbol": top.symbol.replace(".JK", ""),
+            "price": top_price,
+            "quantity": tx["quantity"],
+            "score": top.confidence * 100,
+            "confidence": top.confidence,
+            "why": "TOP 1 setelah decision gate + risk filter.",
+        }
+        auth = {
+            "signal": {
+                "symbol": top_payload["symbol"],
                 "action": "BUY",
-                "symbol": top.symbol.replace(".JK", ""),
                 "price": top_price,
                 "quantity": tx["quantity"],
-                "score": top.confidence * 100,
+                "score": top_payload["score"],
                 "confidence": top.confidence,
-                "why": "TOP 1 setelah decision gate + risk filter.",
+                "rank": 1,
+                "reasons": list(top.reason_codes[:6]),
+                "data_used": ["OHLCV", "volume", "momentum", "trend", "volatility", "model score"],
             },
-        )
+            "portfolio": {
+                "cash_available": bundle.account.cash_available,
+                "equity": bundle.account.equity,
+                "positions": [p.to_dict() for p in bundle.positions if p.status == "OPEN"],
+            },
+        }
+        try:
+            narration = narrate_signal(auth)
+            top_payload["why"] = narration
+        except Exception:
+            pass
+        return format_portfolio_telegram(bundle, top=top_payload)
     except PortfolioStoreError as e:
         stages.append(StageResult("paper_buy", "FAIL", str(e)))
         return format_portfolio_telegram(
