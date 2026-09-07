@@ -1,5 +1,5 @@
 """
-Telegram notifier.
+Telegram notifier with cross-run idempotency ledger.
 
 Secrets from environment only:
   TELEGRAM_BOT_TOKEN
@@ -8,8 +8,10 @@ Secrets from environment only:
 Never log secrets. Limited retries with delivery classification.
 HOLD messages are optional (default: do not spam).
 
-Cross-run: rely on deterministic OrderIntent.signal_id in message body.
+Cross-run: IdempotencyLedger (GitHub branch / file / memory).
 Process-level: skip re-send of the same signal_id within this process.
+
+Guarantee: AT-MOST-ONCE for BUY/SELL when ledger required (prefer miss over duplicate).
 """
 
 from __future__ import annotations
@@ -40,6 +42,26 @@ class DeliveryClass(str, Enum):
     SKIPPED = "SKIPPED"
 
 
+def _ledger_required() -> bool:
+    raw = os.environ.get("IDXBOT_LEDGER_REQUIRED", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        return True
+    if os.environ.get("IDXBOT_LEDGER_BACKEND", "").strip().lower() == "github":
+        return True
+    return False
+
+
+def _build_ledger():
+    from idxbot.idempotency.github_store import build_ledger_store
+    from idxbot.idempotency.ledger import IdempotencyLedger
+
+    return IdempotencyLedger(build_ledger_store())
+
+
 class TelegramNotifier:
     def __init__(
         self,
@@ -47,6 +69,7 @@ class TelegramNotifier:
         chat_id: Optional[str] = None,
         enabled: Optional[bool] = None,
         send_hold: bool = False,
+        ledger: Any = None,
     ) -> None:
         self.token = token if token is not None else os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id if chat_id is not None else os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -55,6 +78,22 @@ class TelegramNotifier:
         self.enabled = enabled
         self.send_hold = send_hold
         self._sent_signal_ids: Set[str] = set()
+        self._ledger = ledger
+
+    def _get_ledger(self):
+        if self._ledger is False:
+            return None
+        if self._ledger is not None:
+            return self._ledger
+        try:
+            self._ledger = _build_ledger()
+            return self._ledger
+        except Exception as e:  # noqa: BLE001
+            logger.error("ledger_init_failed", extra={"error_type": type(e).__name__})
+            if _ledger_required():
+                raise
+            self._ledger = False
+            return None
 
     def _mask(self, s: str) -> str:
         if not s:
@@ -182,10 +221,66 @@ class TelegramNotifier:
         return DeliveryClass.TRANSIENT_FAILURE
 
     def notify_signal(self, intent: OrderIntent) -> bool:
+        from idxbot.idempotency.ledger import DeliveryStatus, LedgerUnavailable
+
         if intent.intent == "HOLD" and not self.send_hold:
             return False
+
+        signal_id = intent.signal_id
         text = self.format_signal(intent)
-        result = self.send_message(text, idempotency_key=intent.signal_id)
+
+        ledger = None
+        try:
+            ledger = self._get_ledger()
+        except LedgerUnavailable:
+            if _ledger_required():
+                logger.error("ledger_unavailable_fail_closed", extra={"signal_id_prefix": signal_id[:12]})
+                return False
+            ledger = None
+        except Exception as e:  # noqa: BLE001
+            if _ledger_required():
+                logger.error(
+                    "ledger_unavailable_fail_closed",
+                    extra={"error_type": type(e).__name__, "signal_id_prefix": signal_id[:12]},
+                )
+                return False
+            ledger = None
+
+        if ledger is not None:
+            try:
+                if ledger.should_skip(signal_id):
+                    logger.info("telegram_ledger_skip", extra={"signal_id_prefix": signal_id[:12]})
+                    return False
+                reserved = ledger.reserve(signal_id, symbol=intent.symbol, intent=intent.intent)
+                if not reserved:
+                    logger.info("telegram_ledger_skip_reserve", extra={"signal_id_prefix": signal_id[:12]})
+                    return False
+            except LedgerUnavailable:
+                if _ledger_required():
+                    logger.error("ledger_unavailable_fail_closed")
+                    return False
+                ledger = None
+
+        result = self.send_message(text, idempotency_key=signal_id)
+
+        if ledger is not None:
+            status_map = {
+                DeliveryClass.SUCCESS: DeliveryStatus.SUCCESS,
+                DeliveryClass.UNKNOWN_DELIVERY_STATE: DeliveryStatus.UNKNOWN_DELIVERY_STATE,
+                DeliveryClass.PERMANENT_FAILURE: DeliveryStatus.PERMANENT_FAILURE,
+                DeliveryClass.TRANSIENT_FAILURE: DeliveryStatus.TRANSIENT_FAILURE,
+                DeliveryClass.SKIPPED: None,
+            }
+            st = status_map.get(result)
+            if st is not None:
+                try:
+                    ledger.finalize(signal_id, st, symbol=intent.symbol, intent=intent.intent)
+                except LedgerUnavailable:
+                    logger.error(
+                        "ledger_finalize_failed",
+                        extra={"signal_id_prefix": signal_id[:12], "status": result.value},
+                    )
+
         return result == DeliveryClass.SUCCESS
 
     def notify_daily(self, summary: dict[str, Any]) -> bool:
