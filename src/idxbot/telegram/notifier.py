@@ -5,8 +5,11 @@ Secrets from environment only:
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
 
-Never log secrets. Limited retries. Timeout required.
+Never log secrets. Limited retries with delivery classification.
 HOLD messages are optional (default: do not spam).
+
+Cross-run: rely on deterministic OrderIntent.signal_id in message body.
+Process-level: skip re-send of the same signal_id within this process.
 """
 
 from __future__ import annotations
@@ -17,7 +20,8 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Optional
+from enum import Enum
+from typing import Any, Optional, Set
 
 from idxbot.signals.order_intent import OrderIntent
 
@@ -26,6 +30,14 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 TIMEOUT_SEC = 10.0
 RETRY_BACKOFF = 1.5
+
+
+class DeliveryClass(str, Enum):
+    SUCCESS = "SUCCESS"
+    TRANSIENT_FAILURE = "TRANSIENT_FAILURE"
+    PERMANENT_FAILURE = "PERMANENT_FAILURE"
+    UNKNOWN_DELIVERY_STATE = "UNKNOWN_DELIVERY_STATE"
+    SKIPPED = "SKIPPED"
 
 
 class TelegramNotifier:
@@ -42,6 +54,7 @@ class TelegramNotifier:
             enabled = bool(self.token and self.chat_id)
         self.enabled = enabled
         self.send_hold = send_hold
+        self._sent_signal_ids: Set[str] = set()
 
     def _mask(self, s: str) -> str:
         if not s:
@@ -62,6 +75,7 @@ class TelegramNotifier:
             f"Governor: {intent.governor_state}",
             f"Portfolio: {'ALLOWED' if intent.portfolio_allowed else 'BLOCKED'}",
             f"Timestamp: {intent.timestamp}",
+            f"SignalID: {intent.signal_id}",
         ]
         if intent.reason_codes:
             lines.append(f"Reasons: {', '.join(intent.reason_codes)}")
@@ -81,13 +95,20 @@ class TelegramNotifier:
         ]
         return "\n".join(lines)
 
-    def send_message(self, text: str) -> bool:
+    def send_message(self, text: str, *, idempotency_key: str = "") -> DeliveryClass:
         if not self.enabled:
             logger.info("telegram_disabled")
-            return False
+            return DeliveryClass.SKIPPED
         if not self.token or not self.chat_id:
             logger.warning("telegram_missing_credentials")
-            return False
+            return DeliveryClass.PERMANENT_FAILURE
+
+        if idempotency_key and idempotency_key in self._sent_signal_ids:
+            logger.info(
+                "telegram_dedupe_skip",
+                extra={"signal_id_prefix": idempotency_key[:12]},
+            )
+            return DeliveryClass.SKIPPED
 
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
@@ -98,39 +119,76 @@ class TelegramNotifier:
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
 
-        last_err: Optional[Exception] = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 req = urllib.request.Request(url, data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
                     if 200 <= resp.status < 300:
+                        if idempotency_key:
+                            self._sent_signal_ids.add(idempotency_key)
                         logger.info(
                             "telegram_sent",
-                            extra={"attempt": attempt, "chat_id_masked": self._mask(self.chat_id)},
+                            extra={
+                                "attempt": attempt,
+                                "chat_id_masked": self._mask(self.chat_id),
+                                "signal_id_prefix": (idempotency_key[:12] if idempotency_key else ""),
+                            },
                         )
-                        return True
-                    last_err = RuntimeError(f"HTTP {resp.status}")
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                last_err = e
+                        return DeliveryClass.SUCCESS
+                    if 500 <= resp.status < 600:
+                        cls = DeliveryClass.TRANSIENT_FAILURE
+                    elif resp.status == 429:
+                        cls = DeliveryClass.TRANSIENT_FAILURE
+                    else:
+                        logger.error(
+                            "telegram_permanent_http",
+                            extra={"status": resp.status, "attempt": attempt},
+                        )
+                        return DeliveryClass.PERMANENT_FAILURE
+            except TimeoutError:
+                logger.warning(
+                    "telegram_unknown_delivery",
+                    extra={"attempt": attempt, "error_type": "TimeoutError"},
+                )
+                return DeliveryClass.UNKNOWN_DELIVERY_STATE
+            except urllib.error.HTTPError as e:
+                if e.code == 429 or (500 <= e.code < 600):
+                    cls = DeliveryClass.TRANSIENT_FAILURE
+                    logger.warning(
+                        "telegram_attempt_failed",
+                        extra={"attempt": attempt, "error_type": "HTTPError", "code": e.code},
+                    )
+                else:
+                    logger.error(
+                        "telegram_permanent_http",
+                        extra={"attempt": attempt, "code": getattr(e, "code", None)},
+                    )
+                    return DeliveryClass.PERMANENT_FAILURE
+            except (urllib.error.URLError, OSError) as e:
+                cls = DeliveryClass.TRANSIENT_FAILURE
                 logger.warning(
                     "telegram_attempt_failed",
                     extra={"attempt": attempt, "error_type": type(e).__name__},
                 )
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF * attempt)
+            else:
+                cls = DeliveryClass.TRANSIENT_FAILURE
 
-        logger.error(
-            "telegram_failed",
-            extra={"error_type": type(last_err).__name__ if last_err else "unknown"},
-        )
-        return False
+            if cls == DeliveryClass.TRANSIENT_FAILURE and attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF * attempt)
+                continue
+            break
+
+        logger.error("telegram_failed", extra={"class": "TRANSIENT_FAILURE"})
+        return DeliveryClass.TRANSIENT_FAILURE
 
     def notify_signal(self, intent: OrderIntent) -> bool:
         if intent.intent == "HOLD" and not self.send_hold:
             return False
         text = self.format_signal(intent)
-        return self.send_message(text)
+        result = self.send_message(text, idempotency_key=intent.signal_id)
+        return result == DeliveryClass.SUCCESS
 
     def notify_daily(self, summary: dict[str, Any]) -> bool:
         text = self.format_daily_summary(summary)
-        return self.send_message(text)
+        result = self.send_message(text)
+        return result == DeliveryClass.SUCCESS
