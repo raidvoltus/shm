@@ -2,7 +2,6 @@ name: IDX Signal Mode (Weekday)
 
 on:
   schedule:
-    # 02:00 UTC ≈ 09:00 Asia/Jakarta (WIB = UTC+7)
     - cron: "0 2 * * 1-5"
   workflow_dispatch:
 
@@ -32,6 +31,7 @@ jobs:
       MAX_TRAINING_MINUTES: "19"
       IDXBOT_STATE_BACKEND: "local"
       IDXBOT_STATE_DIR: ".state"
+      IDXBOT_PORTFOLIO_DIR: ".state"
       IDXBOT_LEDGER_BACKEND: "github"
       IDXBOT_LEDGER_REQUIRED: "true"
       IDXBOT_LEDGER_BRANCH: "idxbot-state"
@@ -61,41 +61,76 @@ jobs:
           reload_settings()
           s = get_settings()
           s.assert_safe()
-          assert s.live_trading is False, 'LIVE_TRADING must be False'
-          assert s.paper_trading is True, 'PAPER_TRADING must be True'
-          assert getattr(s, 'paper_trading_only', True) is True, 'PAPER_TRADING_ONLY must be True'
-          assert getattr(s, 'execution_mode', 'SIGNAL_ONLY') == 'SIGNAL_ONLY', 'EXECUTION_MODE must be SIGNAL_ONLY'
-          print('SAFETY OK: live=false paper=true mode=SIGNAL_ONLY')
+          assert s.live_trading is False
+          assert s.paper_trading is True
+          assert getattr(s, 'paper_trading_only', True) is True
+          assert getattr(s, 'execution_mode', 'SIGNAL_ONLY') == 'SIGNAL_ONLY'
+          print('SAFETY OK')
           "
 
-      - name: Ensure idxbot-state ledger branch
+      - name: Ensure idxbot-state branch
         run: |
           set -e
           git fetch origin idxbot-state:idxbot-state 2>/dev/null || true
           if git rev-parse --verify idxbot-state >/dev/null 2>&1; then
-            echo "idxbot-state branch exists"
+            echo "idxbot-state exists"
           else
-            echo "Bootstrapping idxbot-state branch"
             git checkout --orphan idxbot-state
             git rm -rf . >/dev/null 2>&1 || true
-            mkdir -p idempotency
+            mkdir -p idempotency portfolio
             printf '%s\n' '{"schema_version":1,"entries":[]}' > idempotency/ledger.json
-            git add idempotency/ledger.json
+            printf '%s\n' '{"schema_version":1,"state_version":0,"last_updated":"","content_sha":""}' > portfolio/state.json
+            git add idempotency portfolio
             git -c user.email="github-actions[bot]@users.noreply.github.com" -c user.name="github-actions[bot]" \
-              commit -m "chore: bootstrap idxbot-state idempotency ledger"
+              commit -m "chore: bootstrap idxbot-state"
             git push origin idxbot-state
             git checkout main || git checkout -
           fi
+
+      - name: Restore paper portfolio from idxbot-state
+        run: |
+          set -e
+          git fetch origin idxbot-state:idxbot-state 2>/dev/null || true
+          mkdir -p .state/portfolio
+          git show idxbot-state:portfolio/account.json > .state/portfolio/account.json 2>/dev/null || true
+          git show idxbot-state:portfolio/positions.json > .state/portfolio/positions.json 2>/dev/null || true
+          git show idxbot-state:portfolio/transactions.jsonl > .state/portfolio/transactions.jsonl 2>/dev/null || true
+          git show idxbot-state:portfolio/signals.jsonl > .state/portfolio/signals.jsonl 2>/dev/null || true
+          git show idxbot-state:portfolio/state.json > .state/portfolio/state.json 2>/dev/null || true
+          ls -la .state/portfolio || true
 
       - name: Signal pipeline
         run: |
           python -m idxbot --mode SIGNAL --json
 
+      - name: Persist paper portfolio to idxbot-state
+        if: always()
+        run: |
+          set -e
+          if [ ! -d .state/portfolio ]; then
+            echo "No local portfolio"
+            exit 0
+          fi
+          git fetch origin idxbot-state:idxbot-state 2>/dev/null || true
+          git checkout idxbot-state 2>/dev/null || git checkout -b idxbot-state
+          mkdir -p portfolio
+          cp -a .state/portfolio/. portfolio/ || true
+          git add portfolio/
+          if git diff --cached --quiet; then
+            echo "No portfolio changes"
+          else
+            git -c user.email="github-actions[bot]@users.noreply.github.com" \
+                -c user.name="github-actions[bot]" \
+                commit -m "chore(portfolio): persist paper account/positions/transactions"
+            git pull --rebase origin idxbot-state || true
+            git push origin idxbot-state
+          fi
+          git checkout main || git checkout -
+
       - name: Verify local state written (informational)
         run: |
           if [ -d .state ]; then
-            echo "Local .state directory present after run:"
             find .state -type f | head -50 || true
           else
-            echo "NOTE: .state not present (SKIP or in-memory only)"
+            echo "NOTE: .state not present"
           fi
