@@ -23,10 +23,12 @@ from idxbot.data.providers.registry import (
     build_default_registry,
 )
 from idxbot.data.quality.engine import QualityStatus
+from idxbot.decision.engine import DecisionEngine
 from idxbot.governor.governor import ComputationalGovernor, GovernorDecision
 from idxbot.portfolio.governor import PortfolioGovernor, PortfolioDecision
 from idxbot.signals.order_intent import OrderIntent, create_order_intent
 from idxbot.signals.signal_engine import SignalEngine
+from idxbot.telegram.message_composer import compose_with_fallback
 from idxbot.telegram.notifier import TelegramNotifier
 from idxbot.ml.inference import ChampionInferencer
 from idxbot.self_learning.loop import SelfLearningLoop
@@ -34,15 +36,13 @@ from idxbot.self_learning.loop import SelfLearningLoop
 logger = logging.getLogger(__name__)
 JAKARTA = ZoneInfo("Asia/Jakarta")
 
-# Default liquid universe (small for GH Actions Free).
-# Fixture provider uses bare tickers (BBCA); production may use BBCA.JK.
 DEFAULT_UNIVERSE = ("BBCA.JK", "BBRI.JK", "TLKM.JK", "ASII.JK", "BMRI.JK")
 
 
 @dataclass
 class StageResult:
     name: str
-    status: str  # OK | SKIP | FAIL | DEGRADED
+    status: str
     detail: str = ""
     data: dict[str, Any] = field(default_factory=dict)
 
@@ -50,7 +50,7 @@ class StageResult:
 @dataclass
 class PipelineResult:
     run_id: str
-    status: str  # OK | DEGRADED | FAILED | SAFE_EXIT
+    status: str
     stages: list[StageResult] = field(default_factory=list)
     intents: list[OrderIntent] = field(default_factory=list)
     governor_state: str = "UNKNOWN"
@@ -75,10 +75,6 @@ class PipelineResult:
 
 
 class AutonomousPipeline:
-    """
-    Deterministic sequential stages for one autonomous run.
-    """
-
     def __init__(
         self,
         *,
@@ -102,6 +98,7 @@ class AutonomousPipeline:
         self.registry = provider_registry or build_default_registry(allow_fixture=self.allow_fixture)
         self.governor = governor or ComputationalGovernor()
         self.portfolio_gov = portfolio_governor or PortfolioGovernor()
+        self.decision_engine = DecisionEngine()
         self.signal_engine = signal_engine or SignalEngine(
             feature_version=feature_version,
             model_version=model_version,
@@ -115,7 +112,8 @@ class AutonomousPipeline:
         self.universe = list(universe)
         self.feature_version = feature_version
         self.model_version = model_version
-        self._previous_intents: dict[str, str] = {}  # symbol -> intent (ephemeral unless loaded)
+        self._previous_intents: dict[str, str] = {}
+        self._decision_by_sid: dict[str, Any] = {}
         self.registry_root = os.environ.get("IDXBOT_MODEL_REGISTRY", ".models")
         self.allow_momentum_fallback = os.environ.get(
             "IDXBOT_ALLOW_MOMENTUM_FALLBACK", ""
@@ -124,7 +122,7 @@ class AutonomousPipeline:
             self.registry_root,
             expected_feature_version=feature_version,
         )
-        self.learning = SelfLearningLoop(os.environ.get('IDXBOT_EXPERIENCE_ROOT', '.experience'))
+        self.learning = SelfLearningLoop(os.environ.get("IDXBOT_EXPERIENCE_ROOT", ".experience"))
 
     def load_previous_intents(self, state: Mapping[str, str]) -> None:
         self._previous_intents = {k.upper(): v for k, v in state.items()}
@@ -144,9 +142,9 @@ class AutonomousPipeline:
         assert_no_live_trading()
         stages: list[StageResult] = []
         intents: list[OrderIntent] = []
-        persistence_mode = "EPHEMERAL"  # honest default for GH Actions
+        self._decision_by_sid = {}
+        persistence_mode = "EPHEMERAL"
 
-        # --- Stage: Governor ---
         gdec = self.governor.decide(resource_inject=resource_inject)
         gov_state = self._governor_state_label(gdec)
         stages.append(
@@ -165,7 +163,6 @@ class AutonomousPipeline:
 
         if gdec.is_safe_exit or gdec.selection.decision == "SAFE_EXIT":
             stages.append(StageResult("ml", "SKIP", "SAFE_EXIT — no ML"))
-            # still emit HOLD intents for observability
             for sym in self.universe:
                 oi = self.signal_engine.generate(
                     symbol=sym,
@@ -192,20 +189,16 @@ class AutonomousPipeline:
                 self._notify(intents, stages)
             return result
 
-        # --- Stage: Fetch market data ---
         end = scheduled_at.date() if hasattr(scheduled_at, "date") else date.today()
         start = end - timedelta(days=120)
         symbol_data: dict[str, ProviderResult] = {}
         fetch_ok = 0
-        universe = list(self.universe)
-        # Fixture series uses bare tickers (BBCA); try both forms
-        for sym in universe:
+        for sym in list(self.universe):
             pr = self.registry.fetch_historical(sym, start, end)
             if not pr.ok and sym.endswith(".JK"):
                 bare = sym[:-3]
                 pr2 = self.registry.fetch_historical(bare, start, end)
                 if pr2.ok:
-                    # re-canonical symbol in rows
                     for row in pr2.data:
                         row["symbol"] = sym
                     pr = pr2
@@ -235,7 +228,11 @@ class AutonomousPipeline:
                 health={"data": "FAILED", "status": "FAILED"},
             )
 
-        data_status = "DEGRADED" if any(p.status == ProviderStatus.FIXTURE for p in symbol_data.values()) else "OK"
+        data_status = (
+            "DEGRADED"
+            if any(p.status == ProviderStatus.FIXTURE for p in symbol_data.values())
+            else "OK"
+        )
         stages.append(
             StageResult(
                 "data_fetch",
@@ -245,10 +242,6 @@ class AutonomousPipeline:
             )
         )
 
-        # --- Stage: Quality + simple feature signal (momentum proxy when no trained model) ---
-        # Full FeatureEngine + sklearn inference is available but heavy; we use deterministic
-        # multi-horizon momentum probabilities from adjusted closes when models not loaded.
-        # This keeps pipeline executable without registry artifacts while remaining causal.
         active_n = self._active_model_count(gdec)
         for sym, pr in symbol_data.items():
             if not pr.ok:
@@ -256,12 +249,39 @@ class AutonomousPipeline:
             q = self._quality_check(pr.data)
             if q != "VALID":
                 stages.append(StageResult("quality", "FAIL", f"{sym} {q}", {"symbol": sym}))
+                sd = self.decision_engine.decide(
+                    symbol=sym,
+                    timestamp=scheduled_at,
+                    raw_side="HOLD",
+                    signal_probability=0.5,
+                    confidence=0.0,
+                    market_regime="UNKNOWN",
+                    model_version=self.model_version,
+                    feature_version=self.feature_version,
+                    governor_state=gov_state,
+                    price=None,
+                    missing_data=True,
+                    data_stale=(q == "STALE"),
+                    extra_reasons=(f"QUALITY_{q}",),
+                )
+                oi = create_order_intent(
+                    symbol=sym,
+                    timestamp=scheduled_at,
+                    intent="HOLD",
+                    confidence=0.0,
+                    governor_state=gov_state,
+                    feature_version=self.feature_version,
+                    model_version=self.model_version,
+                    reason_codes=list(sd.risk_results) + list(sd.filter_results),
+                    run_id=run_id,
+                )
+                self._decision_by_sid[oi.signal_id] = sd
+                intents.append(oi)
                 continue
 
             prev = self._previous_intents.get(sym.upper(), "HOLD")
             last_close = float(pr.data[-1].get("close") or pr.data[-1].get("adjusted_close") or 0)
 
-            # --- ML path: champion only; no disguised momentum as production ML ---
             feature_row = self._simple_feature_row(pr.data)
             inf = self.inferencer.predict_row(feature_row)
             reasons: list[str] = []
@@ -281,23 +301,23 @@ class AutonomousPipeline:
                 primary_p = probs.get("5D", 0.5)
                 reasons.append("MOMENTUM_FALLBACK_EXPLICIT")
             else:
-                # Safe default: HOLD when no validated champion
                 probs = {"1D": 0.5, "5D": 0.5, "20D": 0.5}
                 primary_p = 0.5
                 reasons.append(f"MODEL_UNAVAILABLE:{inf.status}")
-                provisional = self.signal_engine.generate(
+                sd = self.decision_engine.decide(
                     symbol=sym,
                     timestamp=scheduled_at,
-                    probability=0.5,
-                    horizons=probs,
-                    previous_intent=prev,
+                    raw_side="HOLD",
+                    signal_probability=0.5,
+                    confidence=0.5,
+                    model_agreement=0.0,
+                    model_version=model_ver,
+                    feature_version=feat_ver,
                     governor_state=gov_state,
-                    active_models=0,
-                    portfolio_allowed=True,
-                    run_id=run_id,
-                    extra_reasons=reasons,
+                    price=last_close if last_close > 0 else None,
+                    model_corrupt=False,
+                    extra_reasons=tuple(reasons) + ("HOLD_NO_CHAMPION",),
                 )
-                # force HOLD
                 oi = create_order_intent(
                     symbol=sym,
                     timestamp=scheduled_at,
@@ -312,13 +332,14 @@ class AutonomousPipeline:
                     horizons=probs,
                     run_id=run_id,
                 )
+                self._decision_by_sid[oi.signal_id] = sd
                 intents.append(oi)
                 self._previous_intents[sym.upper()] = "HOLD"
                 stages.append(
                     StageResult(
                         "signal",
                         "DEGRADED",
-                        f"{sym} HOLD (no champion)",
+                        f"{sym} NO_SIGNAL (no champion)",
                         {"symbol": sym, "intent": "HOLD", "ml_status": inf.status},
                     )
                 )
@@ -349,36 +370,84 @@ class AutonomousPipeline:
             reasons = list(provisional.reason_codes) + list(pdec.reason_codes)
             if not pdec.allowed and provisional.intent == "BUY":
                 final_intent = "HOLD"
+                reasons.append("PORTFOLIO_BLOCK")
 
+            closes = [
+                float(r.get("close") or r.get("adjusted_close") or 0) for r in pr.data[-20:]
+            ]
+            closes = [c for c in closes if c > 0]
+            if len(closes) >= 5:
+                rets = [
+                    (closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))
+                ]
+                import statistics
+
+                vol = statistics.pstdev(rets) if len(rets) > 1 else 0.0
+                volatility_score = min(1.0, vol * 25.0)
+            else:
+                volatility_score = 0.5
+            liquidity_score = 0.6 if last_close > 0 else 0.0
+            agreement = min(1.0, n_models / 7.0) if n_models else 0.0
+            regime = getattr(provisional, "regime", "") or "UNKNOWN"
+
+            sd = self.decision_engine.decide(
+                symbol=sym,
+                timestamp=scheduled_at,
+                raw_side=final_intent,
+                signal_probability=float(primary_p),
+                confidence=float(provisional.confidence),
+                model_agreement=agreement,
+                volatility_score=volatility_score,
+                liquidity_score=liquidity_score,
+                expected_value=float(primary_p - 0.5),
+                risk_reward=1.0,
+                market_regime=regime,
+                model_version=model_ver,
+                feature_version=feat_ver,
+                governor_state=gov_state,
+                active_models=n_models,
+                price=last_close if last_close > 0 else None,
+                extra_reasons=tuple(reasons),
+            )
+            mapped = sd.to_order_intent_fields()
             oi = create_order_intent(
                 symbol=sym,
                 timestamp=scheduled_at,
-                intent=final_intent,  # type: ignore[arg-type]
-                confidence=provisional.confidence,
+                intent=mapped["intent"],  # type: ignore[arg-type]
+                confidence=sd.confidence,
                 governor_state=gov_state,
                 feature_version=feat_ver,
                 model_version=model_ver,
                 active_models=n_models,
                 portfolio_allowed=pdec.allowed,
-                reason_codes=reasons,
+                reason_codes=list(sd.filter_results) + list(sd.risk_results),
                 horizons=probs,
                 run_id=run_id,
             )
+            self._decision_by_sid[oi.signal_id] = sd
             intents.append(oi)
             self._previous_intents[sym.upper()] = oi.intent
             stages.append(
                 StageResult(
                     "signal",
                     "OK",
-                    f"{sym} {oi.intent}",
-                    {"symbol": sym, "intent": oi.intent, "confidence": oi.confidence, "ml": inf.status},
+                    f"{sym} {sd.decision}",
+                    {
+                        "symbol": sym,
+                        "intent": oi.intent,
+                        "decision": sd.decision,
+                        "confidence": oi.confidence,
+                        "ml": inf.status,
+                        "risk_score": sd.risk_score,
+                    },
                 )
             )
 
-        stages.append(StageResult("ensemble", "OK" if active_n else "DEGRADED", f"active_models={active_n}"))
+        stages.append(
+            StageResult("ensemble", "OK" if active_n else "DEGRADED", f"active_models={active_n}")
+        )
         stages.append(StageResult("portfolio_governor", "OK", f"intents={len(intents)}"))
 
-        # Experience store (predictions only; outcomes resolved later)
         if not dry_run and intents:
             try:
                 n_exp = self.learning.persist_predictions(intents)
@@ -386,10 +455,15 @@ class AutonomousPipeline:
             except Exception as e:
                 stages.append(StageResult("experience", "FAIL", type(e).__name__))
 
-        # Telegram (after intents + experience)
         if not dry_run:
             tg_ok = self._notify(intents, stages)
-            stages.append(StageResult("telegram", "OK" if tg_ok else "DEGRADED", "sent" if tg_ok else "failed_or_skipped"))
+            stages.append(
+                StageResult(
+                    "telegram",
+                    "OK" if tg_ok else "DEGRADED",
+                    "sent" if tg_ok else "failed_or_skipped",
+                )
+            )
 
         overall = "OK"
         if data_status == "DEGRADED":
@@ -451,62 +525,40 @@ class AutonomousPipeline:
             prev_ts = ts
         return "VALID"
 
-
     def _simple_feature_row(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """Causal lightweight features for champion inference (no lookahead)."""
         closes = []
-        volumes = []
         for r in rows:
             c = r.get("adjusted_close", r.get("close"))
             if c is not None:
                 closes.append(float(c))
-            volumes.append(float(r.get("volume") or 0))
         row: dict[str, Any] = {}
         if len(closes) < 25:
             return row
+
         def ret(n: int) -> float:
-            if closes[-n-1] == 0:
+            if closes[-n - 1] == 0:
                 return 0.0
-            return (closes[-1] / closes[-n-1]) - 1.0
+            return (closes[-1] / closes[-n - 1]) - 1.0
+
         row["return_1d"] = ret(1)
         row["return_5d"] = ret(5)
         row["return_20d"] = ret(20)
         import statistics
+
         window = closes[-20:]
         mean = statistics.fmean(window)
         row["sma_20"] = mean
         row["price_vs_sma20"] = (closes[-1] / mean - 1.0) if mean else 0.0
-        # rsi-ish
-        gains = []
-        losses = []
-        for i in range(1, min(15, len(closes))):
-            d = closes[-i] - closes[-i-1]
-            gains.append(max(d, 0.0))
-            losses.append(max(-d, 0.0))
-        ag = statistics.fmean(gains) if gains else 0.0
-        al = statistics.fmean(losses) if losses else 1e-9
-        rs = ag / al if al else 0.0
-        row["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
-        row["rolling_volatility_20"] = statistics.pstdev([ret(i) for i in range(1, 21)]) if len(closes) > 21 else 0.0
-        row["volume_ratio_20"] = (volumes[-1] / statistics.fmean(volumes[-20:])) if statistics.fmean(volumes[-20:]) else 1.0
         return row
 
     def _momentum_horizons(self, rows: list[dict[str, Any]]) -> dict[str, float]:
-        """
-        Causal multi-horizon probability proxy from adjusted closes.
-        P(up) ≈ sigmoid of forward-looking-free past return.
-        Deterministic; no future bars.
-        """
         closes = []
         for r in rows:
             c = r.get("adjusted_close", r.get("close"))
             if c is not None:
                 closes.append(float(c))
-        if len(closes) < 25:
-            return {"1D": 0.5, "5D": 0.5, "20D": 0.5}
 
         def _p(ret: float) -> float:
-            # squash to (0,1)
             x = max(-3.0, min(3.0, ret * 10))
             return 1.0 / (1.0 + pow(2.718281828, -x))
 
@@ -522,14 +574,15 @@ class AutonomousPipeline:
         }
 
     def _notify(self, intents: Sequence[OrderIntent], stages: list[StageResult]) -> bool:
+        """Always-send: BUY, SELL, and NO_SIGNAL (HOLD) each get one Telegram report."""
         any_sent = False
         for oi in intents:
-            if oi.intent == "HOLD":
-                continue
             try:
-                if self.notifier.notify_signal(oi):
+                sd = self._decision_by_sid.get(oi.signal_id)
+                msg = compose_with_fallback(sd) if sd is not None else None
+                if self.notifier.notify_signal(oi, decision=sd, message_text=msg):
                     any_sent = True
-            except Exception as e:  # network boundary only
+            except Exception as e:
                 logger.error("telegram_notify_error", extra={"error_type": type(e).__name__})
                 stages.append(StageResult("telegram", "FAIL", type(e).__name__))
         return any_sent
