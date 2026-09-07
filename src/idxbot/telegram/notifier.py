@@ -5,13 +5,10 @@ Secrets from environment only:
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
 
-Never log secrets. Limited retries with delivery classification.
-HOLD messages are optional (default: do not spam).
+Always-send contract: BUY, SELL, and NO_SIGNAL (HOLD) all produce reports.
 
 Cross-run: IdempotencyLedger (GitHub branch / file / memory).
-Process-level: skip re-send of the same signal_id within this process.
-
-Guarantee: AT-MOST-ONCE for BUY/SELL when ledger required (prefer miss over duplicate).
+Guarantee: AT-MOST-ONCE when ledger required (prefer miss over duplicate).
 """
 
 from __future__ import annotations
@@ -104,11 +101,12 @@ class TelegramNotifier:
 
     def format_signal(self, intent: OrderIntent) -> str:
         conf_pct = f"{intent.confidence * 100:.2f}%"
+        label = "NO SIGNAL" if intent.intent == "HOLD" else intent.intent
         lines = [
-            "IDX SIGNAL BOT",
+            "IDX SIGNAL REPORT",
             "",
             f"Symbol: {intent.symbol}",
-            f"Intent: {intent.intent}",
+            f"Decision: {label}",
             f"Confidence: {conf_pct}",
             f"Models: {intent.active_models}/7",
             f"Governor: {intent.governor_state}",
@@ -220,21 +218,30 @@ class TelegramNotifier:
         logger.error("telegram_failed", extra={"class": "TRANSIENT_FAILURE"})
         return DeliveryClass.TRANSIENT_FAILURE
 
-    def notify_signal(self, intent: OrderIntent) -> bool:
+    def notify_signal(
+        self, intent: OrderIntent, *, decision=None, message_text: str | None = None
+    ) -> bool:
         from idxbot.idempotency.ledger import DeliveryStatus, LedgerUnavailable
 
-        if intent.intent == "HOLD" and not self.send_hold:
-            return False
-
         signal_id = intent.signal_id
-        text = self.format_signal(intent)
+        if message_text:
+            text = message_text
+        elif decision is not None:
+            from idxbot.telegram.message_composer import compose_with_fallback
+
+            text = compose_with_fallback(decision)
+        else:
+            text = self.format_signal(intent)
 
         ledger = None
         try:
             ledger = self._get_ledger()
         except LedgerUnavailable:
             if _ledger_required():
-                logger.error("ledger_unavailable_fail_closed", extra={"signal_id_prefix": signal_id[:12]})
+                logger.error(
+                    "ledger_unavailable_fail_closed",
+                    extra={"signal_id_prefix": signal_id[:12]},
+                )
                 return False
             ledger = None
         except Exception as e:  # noqa: BLE001
@@ -249,11 +256,18 @@ class TelegramNotifier:
         if ledger is not None:
             try:
                 if ledger.should_skip(signal_id):
-                    logger.info("telegram_ledger_skip", extra={"signal_id_prefix": signal_id[:12]})
+                    logger.info(
+                        "telegram_ledger_skip", extra={"signal_id_prefix": signal_id[:12]}
+                    )
                     return False
-                reserved = ledger.reserve(signal_id, symbol=intent.symbol, intent=intent.intent)
+                reserved = ledger.reserve(
+                    signal_id, symbol=intent.symbol, intent=intent.intent
+                )
                 if not reserved:
-                    logger.info("telegram_ledger_skip_reserve", extra={"signal_id_prefix": signal_id[:12]})
+                    logger.info(
+                        "telegram_ledger_skip_reserve",
+                        extra={"signal_id_prefix": signal_id[:12]},
+                    )
                     return False
             except LedgerUnavailable:
                 if _ledger_required():
@@ -274,7 +288,9 @@ class TelegramNotifier:
             st = status_map.get(result)
             if st is not None:
                 try:
-                    ledger.finalize(signal_id, st, symbol=intent.symbol, intent=intent.intent)
+                    ledger.finalize(
+                        signal_id, st, symbol=intent.symbol, intent=intent.intent
+                    )
                 except LedgerUnavailable:
                     logger.error(
                         "ledger_finalize_failed",
