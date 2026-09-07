@@ -2,8 +2,13 @@
 Bounded, TTL-aware signal delivery ledger.
 
 Guarantee model: AT-MOST-ONCE notification (prefer miss over duplicate BUY/SELL).
+Not exactly-once: Telegram delivery and ledger commit are separate systems.
 
 Does NOT store secrets, tokens, chat IDs, or market payloads.
+
+PENDING lease expiry policy (safety):
+  Expired PENDING is converted to UNKNOWN_DELIVERY_STATE and remains blocking
+  for the remaining/full TTL window. Telegram may already have accepted the request.
 """
 
 from __future__ import annotations
@@ -24,6 +29,16 @@ SCHEMA_VERSION = 1
 DEFAULT_TTL_HOURS = 24
 DEFAULT_MAX_ENTRIES = 500
 DEFAULT_PENDING_LEASE_MINUTES = 30
+
+ALLOWED_STATUSES = frozenset(
+    {
+        "PENDING",
+        "SUCCESS",
+        "TRANSIENT_FAILURE",
+        "PERMANENT_FAILURE",
+        "UNKNOWN_DELIVERY_STATE",
+    }
+)
 
 
 class DeliveryStatus(str, Enum):
@@ -93,10 +108,54 @@ def _iso(dt: datetime) -> str:
 
 
 def _parse_iso(s: str) -> datetime:
-    s = s.strip()
+    """Parse ISO-8601; require timezone-aware result. Reject naive."""
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("empty timestamp")
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        raise ValueError("naive timestamp rejected")
+    return dt.astimezone(timezone.utc)
+
+
+def validate_ledger_payload(data: Any) -> dict[str, Any]:
+    """Strict schema validation. Fail-closed — never silently reinitialize."""
+    if not isinstance(data, dict):
+        raise LedgerUnavailable("ledger corrupt: root not an object")
+    if "schema_version" not in data:
+        raise LedgerUnavailable("ledger corrupt: missing schema_version")
+    try:
+        ver = int(data["schema_version"])
+    except (TypeError, ValueError) as e:
+        raise LedgerUnavailable("ledger corrupt: invalid schema_version") from e
+    if ver != SCHEMA_VERSION:
+        raise LedgerUnavailable(f"ledger corrupt: unsupported schema_version={ver}")
+    if "entries" not in data:
+        raise LedgerUnavailable("ledger corrupt: missing entries")
+    entries = data["entries"]
+    if not isinstance(entries, list):
+        raise LedgerUnavailable("ledger corrupt: entries not a list")
+    if len(entries) > DEFAULT_MAX_ENTRIES * 2:
+        raise LedgerUnavailable("ledger corrupt: oversized entries")
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            raise LedgerUnavailable(f"ledger corrupt: entry[{i}] not an object")
+        sid = e.get("signal_id")
+        if not sid or not isinstance(sid, str) or len(sid) > 128:
+            raise LedgerUnavailable(f"ledger corrupt: entry[{i}] invalid signal_id")
+        status = e.get("delivery_status")
+        if status not in ALLOWED_STATUSES:
+            raise LedgerUnavailable(f"ledger corrupt: entry[{i}] unknown status")
+        for ts_key in ("created_at", "expires_at"):
+            try:
+                _parse_iso(str(e.get(ts_key, "")))
+            except (TypeError, ValueError) as err:
+                raise LedgerUnavailable(
+                    f"ledger corrupt: entry[{i}] invalid {ts_key}"
+                ) from err
+    return data
 
 
 class LedgerStore(Protocol):
@@ -110,18 +169,22 @@ class LedgerStore(Protocol):
 class MemoryLedgerStore:
     """In-process store for unit tests."""
 
-    def __init__(self) -> None:
-        self._data: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "entries": []}
+    def __init__(self, initial: Optional[dict[str, Any]] = None) -> None:
+        if initial is None:
+            self._data: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "entries": []}
+        else:
+            self._data = json.loads(json.dumps(initial))
 
     def load(self) -> dict[str, Any]:
-        return json.loads(json.dumps(self._data))
+        return validate_ledger_payload(json.loads(json.dumps(self._data)))
 
     def save(self, payload: dict[str, Any]) -> None:
+        validate_ledger_payload(payload)
         self._data = json.loads(json.dumps(payload))
 
 
 class FileLedgerStore:
-    """Atomic local JSON file store (tests / local dev)."""
+    """Atomic local JSON file store (tests / local dev). Missing file = empty."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -131,16 +194,18 @@ class FileLedgerStore:
             return {"schema_version": SCHEMA_VERSION, "entries": []}
         try:
             raw = self.path.read_text(encoding="utf-8")
-            data = json.loads(raw) if raw.strip() else {}
-        except (OSError, json.JSONDecodeError) as e:
+        except OSError as e:
             raise LedgerUnavailable(f"file ledger read failed: {type(e).__name__}") from e
-        if not isinstance(data, dict):
-            raise LedgerUnavailable("file ledger corrupt: not an object")
-        data.setdefault("schema_version", SCHEMA_VERSION)
-        data.setdefault("entries", [])
-        return data
+        if not raw.strip():
+            raise LedgerUnavailable("ledger corrupt: empty file")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise LedgerUnavailable("ledger corrupt: invalid JSON") from e
+        return validate_ledger_payload(data)
 
     def save(self, payload: dict[str, Any]) -> None:
+        validate_ledger_payload(payload)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         try:
@@ -167,7 +232,7 @@ class IdempotencyLedger:
     """
     Cross-run delivery ledger with TTL and MAX_ENTRIES bound.
 
-    Policy: FAIL_CLOSED when store raises LedgerUnavailable (caller decides).
+    PENDING expiry → promote to UNKNOWN_DELIVERY_STATE (block), never silent drop.
     """
 
     def __init__(
@@ -188,20 +253,32 @@ class IdempotencyLedger:
         for e in entries:
             try:
                 exp = _parse_iso(str(e.get("expires_at", "")))
+                created = _parse_iso(str(e.get("created_at", "")))
             except (TypeError, ValueError):
                 continue
             if exp <= now:
                 continue
+
             status = str(e.get("delivery_status", ""))
             if status == DeliveryStatus.PENDING.value:
-                try:
-                    created = _parse_iso(str(e.get("created_at", "")))
-                    if created + self.pending_lease <= now:
+                if created + self.pending_lease <= now:
+                    promoted = dict(e)
+                    promoted["delivery_status"] = DeliveryStatus.UNKNOWN_DELIVERY_STATE.value
+                    target_exp = created + self.ttl
+                    if target_exp > exp:
+                        promoted["expires_at"] = _iso(target_exp)
+                    if _parse_iso(promoted["expires_at"]) <= now:
                         continue
-                except (TypeError, ValueError):
+                    kept.append(promoted)
                     continue
             kept.append(e)
-        kept.sort(key=lambda x: (str(x.get("expires_at", "")), str(x.get("signal_id", ""))))
+
+        def _rank(x: dict[str, Any]) -> tuple:
+            st = str(x.get("delivery_status", ""))
+            prio = 0 if st in TERMINAL_BLOCKING else 1
+            return (prio, str(x.get("expires_at", "")), str(x.get("signal_id", "")))
+
+        kept.sort(key=_rank)
         if len(kept) > self.max_entries:
             kept = kept[-self.max_entries :]
         return kept
@@ -209,20 +286,21 @@ class IdempotencyLedger:
     def _index(self, entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         return {str(e["signal_id"]): e for e in entries if e.get("signal_id")}
 
-    def should_skip(self, signal_id: str) -> bool:
+    def _load_clean(self) -> tuple[list[dict[str, Any]], datetime]:
         data = self.store.load()
         now = _utcnow()
         entries = self._cleanup(list(data.get("entries") or []), now)
-        idx = self._index(entries)
-        e = idx.get(signal_id)
+        return entries, now
+
+    def should_skip(self, signal_id: str) -> bool:
+        entries, _now = self._load_clean()
+        e = self._index(entries).get(signal_id)
         if not e:
             return False
         return str(e.get("delivery_status")) in TERMINAL_BLOCKING
 
     def reserve(self, signal_id: str, *, symbol: str = "", intent: str = "") -> bool:
-        data = self.store.load()
-        now = _utcnow()
-        entries = self._cleanup(list(data.get("entries") or []), now)
+        entries, now = self._load_clean()
         idx = self._index(entries)
         existing = idx.get(signal_id)
         if existing and str(existing.get("delivery_status")) in TERMINAL_BLOCKING:
@@ -252,9 +330,7 @@ class IdempotencyLedger:
     ) -> None:
         if status == DeliveryStatus.PENDING:
             return
-        data = self.store.load()
-        now = _utcnow()
-        entries = self._cleanup(list(data.get("entries") or []), now)
+        entries, now = self._load_clean()
         entries = [e for e in entries if str(e.get("signal_id")) != signal_id]
         entry = LedgerEntry(
             signal_id=signal_id,
@@ -270,7 +346,5 @@ class IdempotencyLedger:
         self.store.save(payload)
 
     def snapshot(self) -> dict[str, Any]:
-        data = self.store.load()
-        now = _utcnow()
-        entries = self._cleanup(list(data.get("entries") or []), now)
+        entries, _now = self._load_clean()
         return {"schema_version": SCHEMA_VERSION, "entries": entries}
