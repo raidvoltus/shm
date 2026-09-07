@@ -10,6 +10,9 @@ concurrency:
   group: idx-signal
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   signal:
     runs-on: ubuntu-latest
@@ -29,6 +32,11 @@ jobs:
       MAX_TRAINING_MINUTES: "19"
       IDXBOT_STATE_BACKEND: "local"
       IDXBOT_STATE_DIR: ".state"
+      IDXBOT_LEDGER_BACKEND: "github"
+      IDXBOT_LEDGER_REQUIRED: "true"
+      IDXBOT_LEDGER_BRANCH: "idxbot-state"
+      IDXBOT_LEDGER_PATH: "idempotency/ledger.json"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
 
@@ -60,8 +68,24 @@ jobs:
           print('SAFETY OK: live=false paper=true mode=SIGNAL_ONLY')
           "
 
-      # State policy: job-local EPHEMERAL only. No cross-run artifact persistence.
-      # Missing state → PortfolioState.create_initial() (FIRST_RUN in code).
+      - name: Ensure idxbot-state ledger branch
+        run: |
+          set -e
+          git fetch origin idxbot-state:idxbot-state 2>/dev/null || true
+          if git rev-parse --verify idxbot-state >/dev/null 2>&1; then
+            echo "idxbot-state branch exists"
+          else
+            echo "Bootstrapping idxbot-state branch"
+            git checkout --orphan idxbot-state
+            git rm -rf . >/dev/null 2>&1 || true
+            mkdir -p idempotency
+            printf '%s\n' '{"schema_version":1,"entries":[]}' > idempotency/ledger.json
+            git add idempotency/ledger.json
+            git -c user.email="github-actions[bot]@users.noreply.github.com" -c user.name="github-actions[bot]" \
+              commit -m "chore: bootstrap idxbot-state idempotency ledger"
+            git push origin idxbot-state
+            git checkout main || git checkout -
+          fi
 
       - name: Signal pipeline
         run: |
