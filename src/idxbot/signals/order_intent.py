@@ -1,8 +1,8 @@
 """
 Immutable OrderIntent contract.
 
-LIVE_TRADING is permanently disabled. This produces intents only:
-BUY / SELL / HOLD.
+LIVE_TRADING is permanently disabled. EXECUTION_MODE=SIGNAL_ONLY.
+This produces intents only: BUY / SELL / HOLD. No broker path.
 
 signal_id is deterministic (SHA-256 of canonical payload) for idempotency.
 """
