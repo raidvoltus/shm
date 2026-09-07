@@ -18,6 +18,7 @@ jobs:
       LIVE_TRADING: "false"
       PAPER_TRADING: "true"
       PAPER_TRADING_ONLY: "true"
+      EXECUTION_MODE: "SIGNAL_ONLY"
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_ENABLED: "true"
@@ -47,7 +48,6 @@ jobs:
           python -c "
           import os
           from idxbot.config import get_settings, reload_settings
-          # Env overrides must not enable live trading
           assert os.environ.get('LIVE_TRADING', 'false').strip().lower() in ('0', 'false', 'no', 'off', ''), \
               'LIVE_TRADING env must not be truthy'
           reload_settings()
@@ -56,25 +56,22 @@ jobs:
           assert s.live_trading is False, 'LIVE_TRADING must be False'
           assert s.paper_trading is True, 'PAPER_TRADING must be True'
           assert getattr(s, 'paper_trading_only', True) is True, 'PAPER_TRADING_ONLY must be True'
-          print('SAFETY OK: live=false paper=true paper_only=true')
+          assert getattr(s, 'execution_mode', 'SIGNAL_ONLY') == 'SIGNAL_ONLY', 'EXECUTION_MODE must be SIGNAL_ONLY'
+          print('SAFETY OK: live=false paper=true mode=SIGNAL_ONLY')
           "
 
-      # State policy:
-      # - Runtime uses LocalStorageBackend under .state within this job only.
-      # - Missing state → PortfolioState.create_initial() (FIRST_RUN handled in code).
-      # - actions/download-artifact cannot restore artifacts from prior workflow runs.
-      # - Cross-run artifact restore/upload was dead infrastructure (silent failure loop).
-      # - Removed restore/persist artifact steps intentionally.
+      # State policy: job-local EPHEMERAL only. No cross-run artifact persistence.
+      # Missing state → PortfolioState.create_initial() (FIRST_RUN in code).
 
       - name: Signal pipeline
         run: |
           python -m idxbot --mode SIGNAL --json
 
-      - name: Verify local state written (informational, non-blocking for empty first paths)
+      - name: Verify local state written (informational)
         run: |
           if [ -d .state ]; then
             echo "Local .state directory present after run:"
             find .state -type f | head -50 || true
           else
-            echo "NOTE: .state not present (pipeline may have SKIPPED or used in-memory only)"
+            echo "NOTE: .state not present (SKIP or in-memory only)"
           fi
