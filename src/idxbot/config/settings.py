@@ -44,7 +44,13 @@ class Settings(BaseModel):
     currency: Literal["IDR"] = "IDR"
     timezone: str = "Asia/Jakarta"
 
-    # Trading mode — LIVE_TRADING is forced false
+    # Execution contract (explicit — no ambiguity)
+    # SIGNAL_ONLY: emit OrderIntent only; no broker; portfolio on GHA is EPHEMERAL.
+    # PAPER_SIM: local paper broker may mutate in-process state (not durable on GHA Free).
+    # LIVE is permanently impossible (fail-closed).
+    execution_mode: Literal["SIGNAL_ONLY", "PAPER_SIM"] = "SIGNAL_ONLY"
+
+    # Safety flags — paper_trading=True means "not live broker", NOT durable paper portfolio.
     paper_trading: bool = True
     live_trading: bool = False
     initial_balance: int = Field(default=10_000_000, ge=0)
@@ -84,7 +90,6 @@ class Settings(BaseModel):
             data = {}
         env_raw = os.environ.get("LIVE_TRADING")
         if env_raw is not None and env_raw.strip().lower() in ("1", "true", "yes", "on"):
-            # Force the field so the field_validator fires
             data = {**data, "live_trading": True}
         return data
 
@@ -131,12 +136,16 @@ class Settings(BaseModel):
         return self
 
     def assert_safe(self) -> None:
-        """Explicit runtime guard."""
+        """Explicit runtime guard — fail-closed."""
         if self.live_trading:
             raise RuntimeError(
                 "SAFETY GUARD: LIVE_TRADING is true. Refusing to continue. "
                 "This project does not support live execution."
             )
+        if self.execution_mode not in ("SIGNAL_ONLY", "PAPER_SIM"):
+            raise RuntimeError(f"SAFETY GUARD: invalid execution_mode={self.execution_mode!r}")
+        if self.execution_mode == "SIGNAL_ONLY" and self.live_trading:
+            raise RuntimeError("SAFETY GUARD: SIGNAL_ONLY contradicts LIVE_TRADING")
 
 
 @lru_cache(maxsize=1)
@@ -146,6 +155,7 @@ def get_settings() -> Settings:
         market=_env_str("MARKET", "IDX"),  # type: ignore[arg-type]
         currency=_env_str("CURRENCY", "IDR"),  # type: ignore[arg-type]
         timezone=_env_str("TIMEZONE", "Asia/Jakarta"),
+        execution_mode=_env_str("EXECUTION_MODE", "SIGNAL_ONLY"),  # type: ignore[arg-type]
         paper_trading=_env_bool("PAPER_TRADING", True),
         live_trading=_env_bool("LIVE_TRADING", False),
         initial_balance=_env_int("INITIAL_BALANCE", 10_000_000),
