@@ -84,7 +84,7 @@ def test_pending_blocks_duplicate():
     assert led.reserve(sid) is False
 
 
-def test_expired_pending_allows():
+def test_expired_pending_promotes_to_unknown():
     store = MemoryLedgerStore()
     led = IdempotencyLedger(store, pending_lease_minutes=0)
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -102,7 +102,8 @@ def test_expired_pending_allows():
             ],
         }
     )
-    assert led.should_skip("oldpend") is False
+    # SAFETY: expired PENDING → UNKNOWN → still blocks (no blind retry)
+    assert led.should_skip("oldpend") is True
 
 
 def test_file_ledger_roundtrip(tmp_path: Path):
