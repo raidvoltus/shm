@@ -30,6 +30,7 @@ jobs:
       ENABLE_COLAB: "false"
       ENABLE_LOCAL_TRAINING: "false"
       IDXBOT_USE_FIXTURE: "false"
+      IDXBOT_FORCE_DYNAMIC_UNIVERSE: "true"
       PYTHONPATH: src
       MAX_TRAINING_MINUTES: "19"
       IDXBOT_STATE_BACKEND: "local"
@@ -81,10 +82,10 @@ jobs:
             git checkout --orphan idxbot-state
             git rm -rf . >/dev/null 2>&1 || true
             mkdir -p idempotency portfolio
-            printf '%s\n' '{"schema_version":1,"entries":[]}' > idempotency/ledger.json
-            printf '%s\n' '{"schema_version":1,"state_version":0,"last_updated":"","content_sha":""}' > portfolio/state.json
+            printf '%s\n' '{\"schema_version\":1,\"entries\":[]}' > idempotency/ledger.json
+            printf '%s\n' '{\"schema_version\":1,\"state_version\":0,\"last_updated\":\"\",\"content_sha\":\"\"}' > portfolio/state.json
             git add idempotency portfolio
-            git -c user.email="github-actions[bot]@users.noreply.github.com" -c user.name="github-actions[bot]" \
+            git -c user.email=\"github-actions[bot]@users.noreply.github.com\" -c user.name=\"github-actions[bot]\" \
               commit -m "chore: bootstrap idxbot-state"
             git push origin idxbot-state
             git checkout main || git checkout -
@@ -102,7 +103,7 @@ jobs:
           git show idxbot-state:portfolio/state.json > .state/portfolio/state.json 2>/dev/null || true
           ls -la .state/portfolio || true
 
-      - name: Signal pipeline
+      - name: Run SIGNAL mode
         run: |
           python -m idxbot --mode SIGNAL --json
 
@@ -111,29 +112,22 @@ jobs:
         run: |
           set -e
           if [ ! -d .state/portfolio ]; then
-            echo "No local portfolio"
-            exit 0
+            echo "no portfolio dir"; exit 0
           fi
           git fetch origin idxbot-state:idxbot-state 2>/dev/null || true
           git checkout idxbot-state 2>/dev/null || git checkout -b idxbot-state
           mkdir -p portfolio
-          cp -a .state/portfolio/. portfolio/ || true
+          cp -f .state/portfolio/account.json portfolio/ 2>/dev/null || true
+          cp -f .state/portfolio/positions.json portfolio/ 2>/dev/null || true
+          cp -f .state/portfolio/transactions.jsonl portfolio/ 2>/dev/null || true
+          cp -f .state/portfolio/signals.jsonl portfolio/ 2>/dev/null || true
+          cp -f .state/portfolio/state.json portfolio/ 2>/dev/null || true
           git add portfolio/
           if git diff --cached --quiet; then
-            echo "No portfolio changes"
+            echo "no portfolio changes"
           else
-            git -c user.email="github-actions[bot]@users.noreply.github.com" \
-                -c user.name="github-actions[bot]" \
-                commit -m "chore(portfolio): persist paper account/positions/transactions"
-            git pull --rebase origin idxbot-state || true
+            git -c user.email="github-actions[bot]@users.noreply.github.com" -c user.name="github-actions[bot]" \
+              commit -m "chore(portfolio): persist paper state after signal"
             git push origin idxbot-state
           fi
-          git checkout main || git checkout -
-
-      - name: Verify local state written (informational)
-        run: |
-          if [ -d .state ]; then
-            find .state -type f | head -50 || true
-          else
-            echo "NOTE: .state not present"
-          fi
+          git checkout main || true
