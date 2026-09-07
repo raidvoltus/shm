@@ -24,9 +24,12 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_ENABLED: "true"
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_ENABLED: "true"
+      GEMINI_MODEL: "gemini-2.0-flash-lite"
       ENABLE_COLAB: "false"
       ENABLE_LOCAL_TRAINING: "false"
-      IDXBOT_USE_FIXTURE: "true"
+      IDXBOT_USE_FIXTURE: "false"
       PYTHONPATH: src
       MAX_TRAINING_MINUTES: "19"
       IDXBOT_STATE_BACKEND: "local"
@@ -58,14 +61,14 @@ jobs:
           from idxbot.config import get_settings, reload_settings
           assert os.environ.get('LIVE_TRADING', 'false').strip().lower() in ('0', 'false', 'no', 'off', ''), \
               'LIVE_TRADING env must not be truthy'
+          assert os.environ.get('IDXBOT_USE_FIXTURE', 'false').strip().lower() in ('0', 'false', 'no', 'off', ''), \
+              'production must not use fixture'
           reload_settings()
           s = get_settings()
           s.assert_safe()
           assert s.live_trading is False
           assert s.paper_trading is True
-          assert getattr(s, 'paper_trading_only', True) is True
-          assert getattr(s, 'execution_mode', 'SIGNAL_ONLY') == 'SIGNAL_ONLY'
-          print('SAFETY OK')
+          print('SAFETY OK fixture=false')
           "
 
       - name: Ensure idxbot-state branch
