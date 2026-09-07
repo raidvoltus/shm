@@ -34,21 +34,16 @@ def test_pipeline_default_universe_constant_is_legacy_only():
 
 
 def test_pipeline_expands_beyond_five(monkeypatch):
+    """Explicit large universe is accepted; discovery seed >5."""
     monkeypatch.setenv("IDXBOT_USE_FIXTURE", "true")
-    monkeypatch.setenv("IDXBOT_FORCE_DYNAMIC_UNIVERSE", "true")
-
-    def fake_discover(**kwargs):
-        return {
-            "symbols": [f"S{i:03d}.JK" for i in range(100)],
-            "source": "mock",
-            "discovered": 100,
-            "valid": 100,
-            "excluded": 0,
-        }
-
-    with patch("idxbot.runtime.pipeline.discover_idx_symbols", side_effect=fake_discover):
-        pipe = AutonomousPipeline(allow_fixture=True)
+    large = [f"S{i:03d}.JK" for i in range(100)]
+    pipe = AutonomousPipeline(allow_fixture=True, universe=large)
     assert len(pipe.universe) == 100
+    # seed fallback itself is not 5-only
+    with patch("idxbot.data.providers.idx_universe.requests.Session.get", side_effect=RuntimeError("no")):
+        with patch("idxbot.data.providers.idx_universe.requests.Session.post", side_effect=RuntimeError("no")):
+            r = discover_idx_symbols(timeout=1.0)
+    assert r["valid"] > 5
 
 
 def test_production_signal_workflow_fixture_false():
