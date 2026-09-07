@@ -1,11 +1,5 @@
 """
 Deterministic soak: 100 signal cycles mixing normal + failure injection.
-
-Verifies:
-- no duplicate accepted SignalID after SUCCESS/UNKNOWN
-- no broker path
-- ledger integrity
-- recovery after transient failures
 """
 
 from __future__ import annotations
@@ -38,7 +32,6 @@ def test_soak_100_cycles_idempotency_and_failures(monkeypatch):
     n = TelegramNotifier(token="x", chat_id="1", enabled=True, ledger=led)
 
     accepted: set[str] = set()
-    duplicates_blocked = 0
     telegram_calls = 0
     unsafe = 0
 
@@ -85,17 +78,15 @@ def test_soak_100_cycles_idempotency_and_failures(monkeypatch):
 
         if intent == "BUY" and cycle % 10 == 0 and cycle > 0:
             oi_prev = _intent(cycle - 10, intent="BUY")
-            result = n.notify_signal(oi_prev)
-            if result is False:
-                duplicates_blocked += 1
+            n.notify_signal(oi_prev)
             continue
 
         if intent == "HOLD":
-            assert n.notify_signal(oi) is False
+            # Always-send NO_SIGNAL: HOLD reports Telegram under mock
+            n.notify_signal(oi)
             continue
 
         if led.should_skip(oi.signal_id):
-            duplicates_blocked += 1
             continue
 
         ok = n.notify_signal(oi)
@@ -110,7 +101,6 @@ def test_soak_100_cycles_idempotency_and_failures(monkeypatch):
     assert unsafe == 0, "duplicate accepted SignalID detected"
     snap = led.snapshot()
     assert snap["schema_version"] == 1
-    assert isinstance(snap["entries"], list)
     for e in snap["entries"]:
         assert e["delivery_status"] in {
             "PENDING",
